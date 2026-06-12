@@ -14,8 +14,9 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
-    chunk_size: int = 512
-    chunk_overlap: int = 128
+    chunk_size: int = 1500
+    chunk_overlap: int = 0
+    max_chunks_per_file: int = 20
 
     # Vector DB
     qdrant_url: str = "http://localhost:6333"
@@ -23,15 +24,19 @@ class Settings(BaseSettings):
     collection_name: str = "repo_intelligence_v2"
 
     # Indexing
-    max_file_size_kb: int = 500
+    max_file_size_kb: int = 100
     supported_extensions: List[str] = [
         ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
         ".java", ".cpp", ".c", ".h", ".rb", ".php", ".swift",
-        ".kt", ".scala", ".md", ".json", ".yaml", ".yml", ".toml"
+        ".kt", ".scala", ".md", ".yaml", ".yml", ".toml"
     ]
     ignore_patterns: List[str] = [
         "node_modules", "venv", ".git", "__pycache__", ".idea",
-        "dist", "build", "*.min.js", "*.lock", ".env", "coverage"
+        "dist", "build", ".env", "coverage", ".next", ".turbo",
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "*.lock", "*.min.js", "*.min.css", "*.map",
+        "*.svg", "*.png", "*.jpg", "*.jpeg", "*.ico",
+        "*.woff", "*.woff2", "*.ttf", "*.eot"
     ]
 
     # Agents

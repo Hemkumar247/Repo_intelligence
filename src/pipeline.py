@@ -26,41 +26,70 @@ class RepoIntelligencePipeline:
         self.diagram_generator = DiagramGenerator()
 
     def index_repository(self, repo_url: str) -> Dict:
-        """Full indexing pipeline for a GitHub repository."""
-        print(f"🔍 Cloning repository: {repo_url}")
+        """Full indexing pipeline for a GitHub repository. Batch-embeds all
+        chunks in one shot for maximum speed."""
+        print(f"[*] Downloading repository: {repo_url}")
         repo_path = self.github.clone_repo(repo_url)
 
         print("📁 Indexing files...")
         code_files, metadata = self.github.index_repository(repo_path)
 
-        print(f"📊 Found {len(code_files)} code files")
+        print(f"[*] Found {len(code_files)} code files -- chunking...")
 
-        # Index each file
+        settings = self.embedder.settings
+        max_chunks = getattr(settings, "max_chunks_per_file", 20)
+
+        # ── Phase 1: Chunk every file (CPU only, very fast) ──────────────────
+        all_chunks: List[Dict] = []       # flat list of all chunks
+        file_chunk_map: List[tuple] = []  # (file_path, repo_name, chunk_index_in_all)
+
+        skipped = 0
+        for i, code_file in enumerate(code_files):
+            print(f"  [{i+1}/{len(code_files)}] {code_file.path}")
+            try:
+                chunks = self.embedder.chunk_code(
+                    content=code_file.content,
+                    language=code_file.language
+                )
+                # Cap chunks per file so huge files don't dominate
+                chunks = chunks[:max_chunks]
+                for chunk in chunks:
+                    chunk["language"] = code_file.language
+                start_idx = len(all_chunks)
+                all_chunks.extend(chunks)
+                file_chunk_map.append((code_file.path, metadata.name, start_idx, start_idx + len(chunks)))
+            except Exception as e:
+                print(f"    SKIP {code_file.path}: {e}")
+                skipped += 1
+
+        if not all_chunks:
+            self.github.cleanup()
+            return {"repo_name": metadata.name, "total_files": len(code_files),
+                    "total_chunks": 0, "metadata": asdict(metadata), "status": "indexed"}
+
+        # ── Phase 2: Batch-embed ALL chunks in ONE call (fast!) ───────────────
+        print(f"\n[*] Embedding {len(all_chunks)} chunks in one batch pass...")
+        texts = [c["text"] for c in all_chunks]
+        embeddings = self.embedder.model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+        for chunk, emb in zip(all_chunks, embeddings):
+            chunk["embedding"] = emb.tolist()
+
+        # ── Phase 3: Upsert into Qdrant file-by-file ─────────────────────────
+        print("\n💾 Storing in vector database...")
         total_chunks = 0
-        for code_file in code_files:
-            print(f"  📝 Processing {code_file.path}...")
-
-            # Chunk the code
-            chunks = self.embedder.chunk_code(
-                content=code_file.content,
-                language=code_file.language
+        for file_path, repo_name, start, end in file_chunk_map:
+            file_chunks = all_chunks[start:end]
+            ids = self.vector_store.index_chunks(
+                chunks=file_chunks,
+                repo_name=repo_name,
+                file_path=file_path
             )
-
-            # Add metadata to chunks
-            for chunk in chunks:
-                chunk["language"] = code_file.language
-
-            # Embed chunks
-            chunks = self.embedder.embed_chunks(chunks)
-
-            # Store in vector DB
-            chunk_ids = self.vector_store.index_chunks(
-                chunks=chunks,
-                repo_name=metadata.name,
-                file_path=code_file.path
-            )
-
-            total_chunks += len(chunk_ids)
+            total_chunks += len(ids)
 
         # Parse for diagrams
         self.diagram_generator.parse_codebase(code_files)
@@ -68,6 +97,7 @@ class RepoIntelligencePipeline:
         # Cleanup
         self.github.cleanup()
 
+        print(f"\n[DONE] {len(code_files) - skipped} files, {total_chunks} chunks indexed.")
         return {
             "repo_name": metadata.name,
             "total_files": len(code_files),

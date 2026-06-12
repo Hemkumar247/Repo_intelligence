@@ -78,16 +78,24 @@ with st.sidebar:
 
     if st.button("🚀 Index Repository", type="primary"):
         if repo_url:
-            with st.spinner("Indexing repository... This may take a few minutes"):
-                try:
-                    result = pipeline.index_repository(repo_url)
-                    st.session_state["current_repo"] = result["repo_name"]
-                    st.session_state["index_result"] = result
-                    st.success(f"✅ Indexed {result['repo_name']}!")
-                except Exception as e:
-                    st.error(f"❌ Error: {e}")
+            status_box = st.empty()
+            try:
+                status_box.info("⏳ Step 1/3 — Downloading repository zip from GitHub...")
+                # Run indexing (pipeline prints progress to terminal too)
+                result = pipeline.index_repository(repo_url)
+                st.session_state["current_repo"] = result["repo_name"]
+                st.session_state["index_result"] = result
+                status_box.empty()
+                st.success(
+                    f"✅ Indexed **{result['repo_name']}** — "
+                    f"{result['total_files']} files, {result['total_chunks']} chunks"
+                )
+            except Exception as e:
+                status_box.empty()
+                st.error(f"❌ Error: {e}")
         else:
             st.warning("Please enter a repository URL")
+
 
     st.markdown("---")
 

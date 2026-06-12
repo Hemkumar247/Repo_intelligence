@@ -44,26 +44,54 @@ class GitHubConnector:
         self.temp_dir = None
 
     def clone_repo(self, repo_url: str) -> str:
-        """Clone a GitHub repository to a temporary directory."""
+        """Download a GitHub repository as a zip via the API (no git binary needed)."""
+        import urllib.request
+        import zipfile
+        import io
+
         # Extract owner/repo from URL
-        match = re.match(r"https?://github\.com/([^/]+)/([^/]+)", repo_url)
+        match = re.match(r"https?://github\.com/([^/]+)/([^/.]+)", repo_url)
         if not match:
             raise ValueError(f"Invalid GitHub URL: {repo_url}")
 
         owner, repo_name = match.groups()
         repo_name = repo_name.replace(".git", "")
 
+        # Use GitHub API to get default branch
+        try:
+            gh_repo = self.github.get_repo(f"{owner}/{repo_name}")
+            branch = gh_repo.default_branch
+        except Exception:
+            branch = "main"
+
+        # Download zip archive of the default branch
+        zip_url = f"https://github.com/{owner}/{repo_name}/archive/refs/heads/{branch}.zip"
+        headers = {}
+        if self.token:
+            headers["Authorization"] = f"token {self.token}"
+
+        print(f"  >> Downloading {owner}/{repo_name} (branch: {branch})...")
+        req = urllib.request.Request(zip_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=120) as response:
+            zip_data = response.read()
+
+        # Extract to temp directory
         self.temp_dir = tempfile.mkdtemp(prefix="repo_intel_")
-        clone_path = os.path.join(self.temp_dir, repo_name)
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            zf.extractall(self.temp_dir)
 
-        # Clone with minimal history for speed
-        Repo.clone_from(
-            repo_url, 
-            clone_path,
-            multi_options=["--depth", "1", "--single-branch"]
-        )
+        # The zip extracts to a folder named <repo>-<branch>/
+        extracted = [
+            d for d in os.listdir(self.temp_dir)
+            if os.path.isdir(os.path.join(self.temp_dir, d))
+        ]
+        if not extracted:
+            raise RuntimeError("Failed to extract repository zip")
 
+        clone_path = os.path.join(self.temp_dir, extracted[0])
+        print(f"  OK  Downloaded and extracted to temp folder")
         return clone_path
+
 
     def get_repo_metadata(self, owner: str, repo_name: str) -> RepoMetadata:
         """Fetch repository metadata from GitHub API."""
