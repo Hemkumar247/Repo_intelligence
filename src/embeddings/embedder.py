@@ -3,7 +3,7 @@ Code Embeddings Module
 Uses SentenceTransformers for semantic code understanding and chunking.
 """
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from sentence_transformers import SentenceTransformer
 import re
 
@@ -18,14 +18,16 @@ class CodeEmbedder:
         self.model = SentenceTransformer(self.model_name)
 
     def chunk_code(self, content: str, language: str, chunk_size: int = None, overlap: int = None) -> List[Dict]:
-        """Split code into semantic chunks preserving context."""
+        """Split code into character-bounded chunks while keeping line references."""
         chunk_size = chunk_size or self.settings.chunk_size
-        overlap = overlap or self.settings.overlap_size if hasattr(self.settings, 'overlap_size') else 128
+        overlap = self.settings.chunk_overlap if overlap is None else overlap
 
         chunks = []
         lines = content.split("\n")
         current_chunk = []
+        current_start_line = 1
         current_length = 0
+        flush_threshold = max(chunk_size // 3, 256)
 
         # Track context: imports, class, function
         context = {"imports": [], "class": None, "function": None}
@@ -44,34 +46,31 @@ class CodeEmbedder:
                     context["function"] = stripped
 
             current_chunk.append(line)
-            current_length += len(line)
+            current_length += len(line) + 1
 
-            # Chunk boundary: function end, class end, or size limit
-            if current_length >= chunk_size or (stripped == "" and len(current_chunk) > 5):
-                chunk_text = "\n".join(current_chunk)
-                chunks.append({
-                    "text": chunk_text,
-                    "start_line": i - len(current_chunk) + 1,
-                    "end_line": i,
-                    "context": context.copy(),
-                    "type": self._detect_chunk_type(chunk_text, language)
-                })
+            should_flush = current_length >= chunk_size
+            blank_boundary = stripped == "" and len(current_chunk) > 5 and current_length >= flush_threshold
+            if should_flush or blank_boundary:
+                chunks.append(self._build_chunk(
+                    current_chunk=current_chunk,
+                    start_line=current_start_line,
+                    end_line=i + 1,
+                    context=context,
+                    language=language
+                ))
 
-                # Overlap for continuity
-                overlap_lines = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                current_chunk = overlap_lines.copy()
-                current_length = sum(len(l) for l in current_chunk)
+                current_chunk, current_start_line = self._trim_overlap(current_chunk, i + 1, overlap)
+                current_length = sum(len(item) + 1 for item in current_chunk)
 
         # Add remaining chunk
         if current_chunk:
-            chunk_text = "\n".join(current_chunk)
-            chunks.append({
-                "text": chunk_text,
-                "start_line": len(lines) - len(current_chunk),
-                "end_line": len(lines),
-                "context": context.copy(),
-                "type": self._detect_chunk_type(chunk_text, language)
-            })
+            chunks.append(self._build_chunk(
+                current_chunk=current_chunk,
+                start_line=current_start_line,
+                end_line=len(lines),
+                context=context,
+                language=language
+            ))
 
         return chunks
 
@@ -118,6 +117,42 @@ class CodeEmbedder:
             similarities.append(float(sim))
 
         return similarities
+
+    def _build_chunk(
+        self,
+        current_chunk: List[str],
+        start_line: int,
+        end_line: int,
+        context: Dict,
+        language: str
+    ) -> Dict:
+        chunk_text = "\n".join(current_chunk)
+        return {
+            "text": chunk_text,
+            "start_line": start_line,
+            "end_line": end_line,
+            "context": context.copy(),
+            "type": self._detect_chunk_type(chunk_text, language)
+        }
+
+    def _trim_overlap(self, current_chunk: List[str], end_line: int, overlap: int) -> tuple[List[str], int]:
+        if overlap <= 0 or not current_chunk:
+            return [], end_line + 1
+
+        overlap_lines: List[str] = []
+        overlap_chars = 0
+        for line in reversed(current_chunk):
+            line_length = len(line) + 1
+            if overlap_lines and overlap_chars + line_length > overlap:
+                break
+            overlap_lines.append(line)
+            overlap_chars += line_length
+            if overlap_chars >= overlap:
+                break
+
+        overlap_lines.reverse()
+        overlap_start_line = end_line - len(overlap_lines) + 1
+        return overlap_lines, overlap_start_line
 
 
 class HybridEmbedder:

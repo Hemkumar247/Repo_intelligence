@@ -7,10 +7,8 @@ from operator import add
 import json
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
 
 from config.settings import get_settings
 from src.vector_db.store import VectorStore
@@ -252,10 +250,10 @@ Analyze the relationships and dependencies. Identify:
         context = state["context"]
 
         # Format references
-        references = []
-        for item in context[:5]:
-            ref = f"- `{item['file_path']}` (lines {item['start_line']}-{item['end_line']})"
-            references.append(ref)
+        references = [
+            f"- `{item['file_path']}` (lines {item['start_line']}-{item['end_line']})"
+            for item in context[:5]
+        ]
 
         if task_type == "architecture":
             final = f"""## Architecture Analysis
@@ -331,6 +329,52 @@ Type: {item['chunk_type']}
 
     def ask(self, query: str, repo_name: str) -> str:
         """Main entry point to ask questions about a repository."""
+        result = self._run_workflow(query, repo_name)
+        return result["final_answer"]
+
+    def ask_with_sources(self, query: str, repo_name: str) -> Dict[str, Any]:
+        """Return a structured answer and normalized source references."""
+        result = self._run_workflow(query, repo_name)
+        sources = self._build_sources(result.get("context", []))
+        return {
+            "answer": result["final_answer"],
+            "sources": sources,
+            "confidence": self._estimate_confidence(result.get("context", [])),
+            "context_preview": self._build_context_preview(result.get("context", []))
+        }
+
+    def find_bugs_structured(self, query: str, repo_name: str) -> Dict[str, Any]:
+        """Return bug analysis in a JSON-friendly contract."""
+        workflow_result = self._run_workflow(query, repo_name)
+        context = workflow_result.get("context", [])
+        context_str = self._format_context(context)
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are an expert code reviewer. Return valid JSON only with the keys "
+                    "'summary' and 'bugs'. Each bug must be an object with keys: title, severity, "
+                    "file_path, start_line, end_line, description, recommendation."
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"User Query: {query}\n\n"
+                    f"Context:\n{context_str}\n\n"
+                    f"Prior Analysis:\n{workflow_result['analysis']}\n\n"
+                    "If no concrete issues are found, return bugs as an empty list."
+                )
+            )
+        ]
+
+        parsed = self._invoke_json(messages)
+        return {
+            "summary": parsed.get("summary", ""),
+            "bugs": parsed.get("bugs", []),
+            "sources": self._build_sources(context)
+        }
+
+    def _run_workflow(self, query: str, repo_name: str) -> AgentState:
+        """Run the workflow and return the final state."""
         initial_state = AgentState(
             messages=[HumanMessage(content=query)],
             query=query,
@@ -342,8 +386,66 @@ Type: {item['chunk_type']}
             final_answer=""
         )
 
-        result = self.workflow.invoke(initial_state)
-        return result["final_answer"]
+        return self.workflow.invoke(initial_state)
+
+    def _build_sources(self, context: List[Dict]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "file_path": item["file_path"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "chunk_type": item.get("chunk_type", ""),
+                "language": item.get("language", ""),
+                "score": item.get("score")
+            }
+            for item in context[:5]
+        ]
+
+    def _build_context_preview(self, context: List[Dict]) -> List[Dict[str, Any]]:
+        previews = []
+        for item in context[:3]:
+            snippet = item.get("content", "").strip()
+            if len(snippet) > 280:
+                snippet = snippet[:280].rstrip() + "..."
+            previews.append({
+                "file_path": item["file_path"],
+                "start_line": item["start_line"],
+                "end_line": item["end_line"],
+                "snippet": snippet,
+            })
+        return previews
+
+    def _estimate_confidence(self, context: List[Dict]) -> str:
+        if not context:
+            return "low"
+        avg_score = sum(item.get("score", 0.0) for item in context[:3]) / min(len(context), 3)
+        if avg_score >= 0.75:
+            return "high"
+        if avg_score >= 0.45:
+            return "medium"
+        return "low"
+
+    def _invoke_json(self, messages: List[Any]) -> Dict[str, Any]:
+        response = self.llm.invoke(messages)
+        content = response.content if hasattr(response, "content") else response
+
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
+
+        if not isinstance(content, str):
+            return {}
+
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start != -1 and end != -1 and start < end:
+                try:
+                    return json.loads(content[start:end + 1])
+                except json.JSONDecodeError:
+                    return {}
+            return {}
 
 
 # Specialized Agents
@@ -386,23 +488,5 @@ class BugFinderAgent:
         if specific_file:
             query += f" in {specific_file}"
 
-        result = self.agent.ask(query, repo_name)
-
-        # Parse structured bug reports
-        bugs = []
-        # Simple parsing - in production, use structured output
-        lines = result.split("\n")
-        current_bug = {}
-
-        for line in lines:
-            if line.startswith("##") or line.startswith("###"):
-                if current_bug:
-                    bugs.append(current_bug)
-                current_bug = {"title": line.strip("# "), "details": []}
-            elif line.strip() and current_bug:
-                current_bug["details"].append(line.strip())
-
-        if current_bug:
-            bugs.append(current_bug)
-
-        return bugs
+        result = self.agent.find_bugs_structured(query, repo_name)
+        return result.get("bugs", [])

@@ -2,14 +2,14 @@
 Vector Database Module
 Manages code embeddings storage and retrieval with Qdrant.
 """
+from collections import Counter
+from datetime import datetime, timezone
 import uuid
 from typing import List, Dict, Optional, Any
-from dataclasses import asdict
-import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, 
-    Filter, FieldCondition, MatchValue, ScoredPoint
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue
 )
 
 from config.settings import get_settings
@@ -58,6 +58,7 @@ class VectorStore:
         """Index code chunks into vector database."""
         points = []
         ids = []
+        indexed_at = datetime.now(timezone.utc).isoformat()
 
         for chunk in chunks:
             point_id = str(uuid.uuid4())
@@ -74,7 +75,8 @@ class VectorStore:
                     "end_line": chunk["end_line"],
                     "language": chunk.get("language", "unknown"),
                     "chunk_type": chunk.get("type", "code"),
-                    "context": chunk.get("context", {})
+                    "context": chunk.get("context", {}),
+                    "indexed_at": indexed_at
                 }
             )
             points.append(point)
@@ -158,10 +160,7 @@ class VectorStore:
         """Get all chunks for a specific file."""
         results = self.client.scroll(
             collection_name=self.collection_name,
-            scroll_filter=Filter(must=[
-                FieldCondition(key="repo_name", match=MatchValue(value=repo_name)),
-                FieldCondition(key="file_path", match=MatchValue(value=file_path))
-            ]),
+            scroll_filter=self._build_filter({"repo_name": repo_name, "file_path": file_path}),
             limit=1000,
             with_payload=True
         )
@@ -180,17 +179,63 @@ class VectorStore:
         """Delete all chunks for a repository."""
         self.client.delete(
             collection_name=self.collection_name,
-            points_selector=Filter(must=[
-                FieldCondition(key="repo_name", match=MatchValue(value=repo_name))
-            ])
+            points_selector=self._build_filter({"repo_name": repo_name})
         )
 
-    def get_stats(self) -> Dict:
-        """Get collection statistics."""
+    def get_stats(self, repo_name: Optional[str] = None) -> Dict:
+        """Get collection or repository statistics."""
         info = self.client.get_collection(self.collection_name)
+        if repo_name is None:
+            return {
+                "scope": "collection",
+                "vectors_count": info.vectors_count,
+                "indexed_vectors_count": info.indexed_vectors_count,
+                "points_count": info.points_count,
+                "status": info.status
+            }
+
+        records = self._scroll_all({"repo_name": repo_name})
+        payloads = [item.payload or {} for item in records]
+        languages = Counter(payload.get("language", "unknown") for payload in payloads)
+        chunk_types = Counter(payload.get("chunk_type", "code") for payload in payloads)
+        file_paths = sorted({payload.get("file_path", "") for payload in payloads if payload.get("file_path")})
+        indexed_times = sorted(payload.get("indexed_at") for payload in payloads if payload.get("indexed_at"))
+
         return {
-            "vectors_count": info.vectors_count,
-            "indexed_vectors_count": info.indexed_vectors_count,
-            "points_count": info.points_count,
-            "status": info.status
+            "scope": "repository",
+            "repo_name": repo_name,
+            "points_count": len(payloads),
+            "files_count": len(file_paths),
+            "file_paths": file_paths,
+            "languages": dict(languages),
+            "chunk_types": dict(chunk_types),
+            "first_indexed_at": indexed_times[0] if indexed_times else None,
+            "last_indexed_at": indexed_times[-1] if indexed_times else None,
+            "collection_status": info.status
         }
+
+    def _build_filter(self, filters: Dict[str, Any]) -> Filter:
+        conditions = [
+            FieldCondition(key=key, match=MatchValue(value=value))
+            for key, value in filters.items()
+        ]
+        return Filter(must=conditions)
+
+    def _scroll_all(self, filters: Optional[Dict[str, Any]] = None, limit: int = 256) -> List[Any]:
+        records = []
+        next_page = None
+        scroll_filter = self._build_filter(filters) if filters else None
+
+        while True:
+            page, next_page = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=scroll_filter,
+                limit=limit,
+                with_payload=True,
+                offset=next_page
+            )
+            records.extend(page)
+            if next_page is None:
+                break
+
+        return records

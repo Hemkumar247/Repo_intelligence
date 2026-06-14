@@ -2,15 +2,14 @@
 GitHub Repository Connector
 Handles cloning, file extraction, and metadata collection.
 """
+import ast
+import fnmatch
 import os
 import re
 import tempfile
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
-from github import Github
-from git import Repo
-import fnmatch
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from config.settings import get_settings
 
@@ -40,8 +39,17 @@ class GitHubConnector:
     def __init__(self, token: Optional[str] = None):
         self.settings = get_settings()
         self.token = token or self.settings.github_token
+        try:
+            from github import Github
+        except ImportError as exc:
+            raise ImportError(
+                "PyGithub is required to use GitHubConnector. Install dependencies "
+                "from requirements.txt before indexing repositories."
+            ) from exc
+
         self.github = Github(self.token)
         self.temp_dir = None
+        self._tree_sitter_parsers: Dict[str, Any] = {}
 
     def clone_repo(self, repo_url: str) -> str:
         """Download a GitHub repository as a zip via the API (no git binary needed)."""
@@ -133,6 +141,13 @@ class GitHubConnector:
 
     def extract_imports(self, content: str, language: str) -> List[str]:
         """Extract import statements from code."""
+        tree_sitter_result = self._extract_with_tree_sitter(content, language)
+        if tree_sitter_result is not None:
+            return tree_sitter_result["imports"]
+
+        if language == "python":
+            return self._extract_python_ast(content)["imports"]
+
         imports = []
 
         if language == "python":
@@ -160,6 +175,13 @@ class GitHubConnector:
 
     def extract_functions(self, content: str, language: str) -> List[Dict]:
         """Extract function definitions with signatures."""
+        tree_sitter_result = self._extract_with_tree_sitter(content, language)
+        if tree_sitter_result is not None:
+            return tree_sitter_result["functions"]
+
+        if language == "python":
+            return self._extract_python_ast(content)["functions"]
+
         functions = []
 
         if language == "python":
@@ -187,6 +209,13 @@ class GitHubConnector:
 
     def extract_classes(self, content: str, language: str) -> List[Dict]:
         """Extract class definitions."""
+        tree_sitter_result = self._extract_with_tree_sitter(content, language)
+        if tree_sitter_result is not None:
+            return tree_sitter_result["classes"]
+
+        if language == "python":
+            return self._extract_python_ast(content)["classes"]
+
         classes = []
 
         if language == "python":
@@ -282,3 +311,203 @@ class GitHubConnector:
         if self.temp_dir and os.path.exists(self.temp_dir):
             import shutil
             shutil.rmtree(self.temp_dir)
+
+    def _extract_python_ast(self, content: str) -> Dict[str, List[Dict]]:
+        """Use Python's AST for accurate Python symbol extraction."""
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return {"imports": self._extract_imports_regex(content, "python"), "functions": [], "classes": []}
+
+        imports: List[str] = []
+        functions: List[Dict[str, Any]] = []
+        classes: List[Dict[str, Any]] = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.append(node.module)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append({
+                    "name": node.name,
+                    "signature": self._get_source_segment(content, node) or f"def {node.name}(...)",
+                    "params": ", ".join(arg.arg for arg in node.args.args),
+                    "return_type": self._ast_unparse(node.returns),
+                    "line": getattr(node, "lineno", 1)
+                })
+            elif isinstance(node, ast.ClassDef):
+                classes.append({
+                    "name": node.name,
+                    "signature": self._get_source_segment(content, node) or f"class {node.name}",
+                    "line": getattr(node, "lineno", 1)
+                })
+
+        return {
+            "imports": sorted(set(imports)),
+            "functions": sorted(functions, key=lambda item: item["line"]),
+            "classes": sorted(classes, key=lambda item: item["line"])
+        }
+
+    def _extract_with_tree_sitter(self, content: str, language: str) -> Optional[Dict[str, List[Dict]]]:
+        """Use Tree-sitter when available for non-Python languages."""
+        parser = self._get_tree_sitter_parser(language)
+        if parser is None:
+            return None
+
+        source = content.encode("utf-8")
+        tree = parser.parse(source)
+        root = tree.root_node
+
+        imports: List[str] = []
+        functions: List[Dict[str, Any]] = []
+        classes: List[Dict[str, Any]] = []
+
+        def walk(node):
+            yield node
+            for child in node.children:
+                yield from walk(child)
+
+        for node in walk(root):
+            node_type = node.type
+            line = node.start_point[0] + 1
+            snippet = source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+            if language in {"javascript", "typescript", "jsx", "tsx"}:
+                if node_type == "import_statement":
+                    match = re.search(r"""['"]([^'"]+)['"]""", snippet)
+                    if match:
+                        imports.append(match.group(1))
+                elif node_type == "call_expression" and "require(" in snippet:
+                    match = re.search(r"""require\(['"]([^'"]+)['"]\)""", snippet)
+                    if match:
+                        imports.append(match.group(1))
+                elif node_type == "function_declaration":
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    params = self._node_text(source, node.child_by_field_name("parameters"))
+                    if name:
+                        functions.append({
+                            "name": name,
+                            "signature": snippet.split("{", 1)[0].strip(),
+                            "params": self._clean_param_text(params),
+                            "line": line
+                        })
+                elif node_type == "class_declaration":
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    if name:
+                        classes.append({"name": name, "signature": snippet.split("{", 1)[0].strip(), "line": line})
+
+            elif language == "go":
+                if node_type == "import_spec":
+                    import_path = self._node_text(source, node.child_by_field_name("path"))
+                    if import_path:
+                        imports.append(import_path.strip('"`'))
+                elif node_type in {"function_declaration", "method_declaration"}:
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    params = self._node_text(source, node.child_by_field_name("parameters"))
+                    result = self._node_text(source, node.child_by_field_name("result"))
+                    if name:
+                        functions.append({
+                            "name": name,
+                            "signature": snippet.split("{", 1)[0].strip(),
+                            "params": self._clean_param_text(params),
+                            "return_type": result.strip() if result else None,
+                            "line": line
+                        })
+                elif node_type == "type_spec" and "struct" in snippet:
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    if name:
+                        classes.append({"name": name, "signature": snippet.split("{", 1)[0].strip(), "line": line})
+
+            elif language == "rust":
+                if node_type == "use_declaration":
+                    use_text = snippet.removeprefix("use").strip().rstrip(";")
+                    if use_text:
+                        imports.append(use_text)
+                elif node_type == "function_item":
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    params = self._node_text(source, node.child_by_field_name("parameters"))
+                    return_type = self._node_text(source, node.child_by_field_name("return_type"))
+                    if name:
+                        functions.append({
+                            "name": name,
+                            "signature": snippet.split("{", 1)[0].strip(),
+                            "params": self._clean_param_text(params),
+                            "return_type": return_type.strip() if return_type else None,
+                            "line": line
+                        })
+                elif node_type == "struct_item":
+                    name = self._node_text(source, node.child_by_field_name("name"))
+                    if name:
+                        classes.append({"name": name, "signature": snippet.split("{", 1)[0].strip(), "line": line})
+
+        return {
+            "imports": sorted(set(imports)),
+            "functions": sorted(functions, key=lambda item: item["line"]),
+            "classes": sorted(classes, key=lambda item: item["line"])
+        }
+
+    def _get_tree_sitter_parser(self, language: str):
+        module_map = {
+            "javascript": ("tree_sitter_javascript", "language"),
+            "jsx": ("tree_sitter_javascript", "language"),
+            "typescript": ("tree_sitter_typescript", "language_typescript"),
+            "tsx": ("tree_sitter_typescript", "language_tsx"),
+            "go": ("tree_sitter_go", "language"),
+            "rust": ("tree_sitter_rust", "language"),
+        }
+        module_info = module_map.get(language)
+        if module_info is None:
+            return None
+
+        if language in self._tree_sitter_parsers:
+            return self._tree_sitter_parsers[language]
+
+        try:
+            from tree_sitter import Language, Parser
+            module_name, attr_name = module_info
+            module = __import__(module_name, fromlist=[attr_name])
+            language_obj = getattr(module, attr_name)()
+            parser = Parser(Language(language_obj))
+            self._tree_sitter_parsers[language] = parser
+            return parser
+        except Exception:
+            self._tree_sitter_parsers[language] = None
+            return None
+
+    def _extract_imports_regex(self, content: str, language: str) -> List[str]:
+        if language != "python":
+            return []
+        imports = []
+        for pattern in [r"^import\s+([\w.]+)", r"^from\s+([\w.]+)\s+import"]:
+            imports.extend(re.findall(pattern, content, re.MULTILINE))
+        return list(set(imports))
+
+    @staticmethod
+    def _node_text(source: bytes, node) -> Optional[str]:
+        if node is None:
+            return None
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _clean_param_text(params: Optional[str]) -> str:
+        if not params:
+            return ""
+        return params.strip().lstrip("(").rstrip(")")
+
+    @staticmethod
+    def _get_source_segment(content: str, node: ast.AST) -> Optional[str]:
+        try:
+            return ast.get_source_segment(content, node)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ast_unparse(node: Optional[ast.AST]) -> Optional[str]:
+        if node is None:
+            return None
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return None

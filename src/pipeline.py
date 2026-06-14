@@ -110,6 +110,10 @@ class RepoIntelligencePipeline:
         """Ask a question about an indexed repository."""
         return self.agent.ask(question, repo_name)
 
+    def ask_with_sources(self, repo_name: str, question: str) -> Dict:
+        """Ask a question and include normalized source references."""
+        return self.agent.ask_with_sources(question, repo_name)
+
     def explain_function(self, repo_name: str, function_name: str) -> str:
         """Explain a specific function."""
         query = f"Explain the function '{function_name}' in detail. What does it do, what are its parameters, and what does it return?"
@@ -147,7 +151,7 @@ class RepoIntelligencePipeline:
 
     def get_repo_stats(self, repo_name: str) -> Dict:
         """Get repository statistics."""
-        return self.vector_store.get_stats()
+        return self.vector_store.get_stats(repo_name)
 
     def delete_repo(self, repo_name: str):
         """Remove a repository from the index."""

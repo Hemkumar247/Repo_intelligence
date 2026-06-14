@@ -1,8 +1,14 @@
+from pydantic import ConfigDict
 from pydantic_settings import BaseSettings
 from typing import Optional, List
 from functools import lru_cache
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
+
     # GitHub
     github_token: Optional[str] = None
 
@@ -23,6 +29,17 @@ class Settings(BaseSettings):
     qdrant_api_key: Optional[str] = None
     collection_name: str = "repo_intelligence_v2"
 
+    # API / runtime
+    cors_origins: List[str] = [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ]
+    state_dir: str = ".repo_intelligence"
+
     # Indexing
     max_file_size_kb: int = 100
     supported_extensions: List[str] = [
@@ -42,10 +59,6 @@ class Settings(BaseSettings):
     # Agents
     max_iterations: int = 10
     recursion_limit: int = 50
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
 @lru_cache()
 def get_settings() -> Settings:
